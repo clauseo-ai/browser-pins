@@ -46,6 +46,8 @@ Minisign keys of their own, separate from the block list key.
 - **No URLs.** The app builds every download URL from one fixed template on Google's
   storage, so a manifest can't redirect a download:
   `https://storage.googleapis.com/chrome-for-testing-public/{version}/{platform}/{name}-{platform}.zip`
+- **Exactly these four platforms:** win64, mac-arm64, mac-x64 and linux64. CI ignores any other
+  platform Google lists (win32, linux-arm64 and the like) and fails if one of the four is missing.
 - **No win-arm64:** Google publishes none. ARM64 Windows uses win64 under emulation.
 - **The trusted comment,** which the signature covers, is exactly:
   `clauseo-browser-pins v1 published=<published> version=<version> run=<run_id>`
@@ -74,6 +76,8 @@ Minisign keys of their own, separate from the block list key.
 - **The same version:** republishes once a day with a fresh `published` (reusing the verified
   current hashes), so the app can tell a live feed from a frozen one.
 - **A lower version:** refuses unless the manual input `allow_downgrade` is set (for Google pulling a release).
+  Because the app refuses rollback, a downgrade reaches only copies that never saw the higher
+  version. To move every copy off a bad build, wait for Google's next higher Stable.
 - **Any failed check:** nothing is published, and the current assets stay. No partial manifests.
 - **The sha256 and size always come from our own download** from the template URL, never from a feed.
 
