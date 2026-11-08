@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Build, sign and publish the Clauseo browser pins v1 (format: SPEC.md).
+# Runs on main only, in the `signing` environment (the only place the signing secrets are).
+# Any failing step stops the job before the upload, so the current assets stay.
+name: publish
+
+on:
+  schedule:
+    - cron: '41 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      allow_downgrade:
+        description: 'Publish even though Google lists a lower Stable version (only for a pulled release)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-browser-pins
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: signing
+    permissions:
+      contents: write
+    env:
+      OUT: ${{ github.workspace }}/out
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require the public keys
+        run: |
+          set -euo pipefail
+          for key in minisign.pub minisign-next.pub; do
+            if [ ! -s "$key" ]; then
+              echo "::error::$key is missing or empty; refusing to build or publish"
+              echo "**Failed:** $key is missing from the repo. Nothing was published." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+
+      - name: Install minisign
+        env:
+          MINISIGN_VERSION: '0.11'
+          MINISIGN_SHA256: 'f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0'
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          curl -fsSL -o "$tmp/minisign.tar.gz" \
+            "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz"
+          echo "${MINISIGN_SHA256}  $tmp/minisign.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/minisign.tar.gz" -C "$tmp" minisign-linux/x86_64/minisign
+          sudo install -m 0755 "$tmp/minisign-linux/x86_64/minisign" /usr/local/bin/minisign
+          rm -rf "$tmp"
+          minisign -v
+
+      - name: Unit tests
+        run: python3 -m unittest -v
+
+      - name: Fetch the current assets and verify them
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$1"
+            echo "**Failed:** $1 Nothing was published." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          CURRENT_DIR="$RUNNER_TEMP/current"
+          mkdir -p "$CURRENT_DIR"
+          code=$(curl -sS --max-time 60 -o "$CURRENT_DIR/release.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GH_REPO}/releases/tags/current") \
+            || fail "could not ask GitHub for release current."
+          case "$code" in
+            404)
+              echo "No release \`current\` yet: first run."
+              echo "path=none" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            200) ;;
+            *) fail "GitHub answered HTTP $code for release current." ;;
+          esac
+          have=$(jq -r '[.assets[].name] as $n
+            | (($n | index("browser-pins-v1.json")) != null)
+              and (($n | index("browser-pins-v1.json.minisig")) != null)' "$CURRENT_DIR/release.json")
+          if [ "$have" != true ]; then
+            echo "Release \`current\` has no complete pair of assets yet: first run."
+            echo "path=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download current --pattern browser-pins-v1.json \
+            --pattern browser-pins-v1.json.minisig --dir "$CURRENT_DIR" --clobber \
+            || fail "could not download the current assets."
+          manifest="$CURRENT_DIR/browser-pins-v1.json"
+          comment=$(scripts/verify.sh --either "$manifest" "$manifest.minisig") \
+            || fail "the current assets do not verify with minisign.pub or minisign-next.pub."
+          python3 build.py --check-comment "$manifest" "$comment" \
+            || fail "the current assets' trusted comment does not match their body."
+          echo "Verified the current assets: \`$comment\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "path=$manifest" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        id: build
+        env:
+          CURRENT: ${{ steps.current.outputs.path }}
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade == true }}
+        run: |
+          set -euo pipefail
+          args=("$CURRENT" --out-dir "$OUT")
+          if [ "$ALLOW_DOWNGRADE" = true ]; then
+            args+=(--allow-downgrade)
+          fi
+          python3 build.py "${args[@]}"
+
+      - name: Sign
+        if: steps.build.outputs.publish == 'true'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          TRUSTED_COMMENT: ${{ steps.build.outputs.trusted_comment }}
+        run: KEY_FILE="$RUNNER_TEMP/minisign.key" scripts/sign.sh "$OUT/browser-pins-v1.json" "$TRUSTED_COMMENT"
+
+      - name: Delete the secret key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
+
+      - name: Verify
+        if: steps.build.outputs.publish == 'true'
+        env:
+          TRUSTED_COMMENT: ${{ steps.build.outputs.trusted_comment }}
+        run: scripts/verify.sh "$OUT/browser-pins-v1.json" "$OUT/browser-pins-v1.json.minisig" "$TRUSTED_COMMENT"
+
+      - name: Upload to the current release
+        if: steps.build.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view current >/dev/null 2>&1; then
+            gh release create current \
+              --title "Clauseo browser pins" \
+              --notes "The signed Clauseo browser pins (Chrome for Testing builds, format: SPEC.md), refreshed every 3 hours. Its two assets are replaced in place on each run. How to verify: https://github.com/${GH_REPO}#readme" \
+              --target "$GITHUB_SHA"
+          fi
+          gh release upload current "$OUT/browser-pins-v1.json" "$OUT/browser-pins-v1.json.minisig" --clobber
+          echo "Published to release \`current\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run summary
+        if: always()
+        env:
+          PUBLISH: ${{ steps.build.outputs.publish || 'not reached' }}
+          VERSION: ${{ steps.build.outputs.version || '-' }}
+        run: |
+          {
+            echo "## Clauseo browser pins run"
+            echo ""
+            echo "- publish: \`$PUBLISH\`"
+            echo "- version: \`$VERSION\`"
+            echo "- run: \`$GITHUB_RUN_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
