@@ -1,0 +1,8 @@
+# Code owners. The owner reviews signing, verifying, workflow and publisher changes,
+# because they decide what gets signed and published.
+/.github/ @ro-hansolo
+/scripts/sign.sh @ro-hansolo
+/scripts/verify.sh @ro-hansolo
+/build.py @ro-hansolo
+/minisign.pub @ro-hansolo
+/minisign-next.pub @ro-hansolo
