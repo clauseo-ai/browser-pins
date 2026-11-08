@@ -15,7 +15,9 @@
 #   - only HTTP 404 on release `current` is a first run;
 #   - a release that exists but lacks either asset fails, unless RECOVER_INCOMPLETE=true;
 #   - when both assets are there, the signature must verify with minisign.pub or
-#     minisign-next.pub, and the signed trusted comment must match the manifest body.
+#     minisign-next.pub, and the signed trusted comment must match the manifest body;
+#   - a verified current manifest published more than 3 days ago gets a ::warning:: and a
+#     summary line (a warning only: the run goes on).
 set -euo pipefail
 
 usage="usage: fetch-current.sh <dest dir>"
@@ -80,4 +82,16 @@ comment=$(scripts/verify.sh --either "$manifest" "$manifest.minisig") \
 python3 build.py --check-comment "$manifest" "$comment" >&2 \
   || fail "the current assets' trusted comment does not match their body."
 summary "Verified the current assets: \`$comment\`"
+
+# The comment check validated the body, so its published time is a SPEC timestamp.
+# Older than 3 days: recent publishes have not succeeded. Warn now, in every run,
+# so a pipeline that keeps failing is noticed well before the app's 45-day expiry.
+published=$(jq -r '.published' "$manifest") || fail "could not read the current published time."
+published_epoch=$(date -u -d "$published" +%s) || fail "could not read the current published time."
+age=$(( $(date -u +%s) - published_epoch ))
+if [ "$age" -gt $(( 3 * 86400 )) ]; then
+  days=$(( age / 86400 ))
+  note "::warning::the current manifest was published $days days ago ($published), more than 3."
+  summary "**Warning:** the current manifest was published $days days ago ($published), more than 3: recent publishes have not succeeded."
+fi
 echo "$manifest"
