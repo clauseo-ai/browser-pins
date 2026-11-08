@@ -190,7 +190,7 @@ jobs:
           name: browser-pins-v1
           path: out
 
-      - name: Validate the new manifest
+      - name: Validate the new manifest (checks Google's listed version and file sizes)
         id: validate
         env:
           CURRENT: ${{ steps.current.outputs.path }}
