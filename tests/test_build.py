@@ -744,5 +744,132 @@ class SigningScriptsTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class ValidateModeTest(Base):
+    """build.py --validate: the publish job's check. It must never touch the network."""
+
+    MIB = 1024 * 1024
+
+    def new_file(self, doc=None, name="new.json"):
+        return write_json(os.path.join(self.tmp, name), doc or manifest_doc(
+            version=NEW, published=NOW_S, size=5 * self.MIB))
+
+    def validate(self, new, current="none", extra=(), now=NOW):
+        args = ["--validate", new, current, "--run-id", RUN] + list(extra)
+        return self.main(args, now=now)
+
+    def test_first_run_passes_and_computes_comment(self):
+        rc, _, _ = self.validate(self.new_file())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh_outputs(), {
+            "trusted_comment": f"clauseo-browser-pins v1 published={NOW_S} version={NEW} run={RUN}",
+            "version": NEW})
+        self.assertEqual(self.web.calls, [])  # no network, no zips
+        self.assertFalse(os.path.exists(self.out))  # and it writes no manifest
+
+    def test_newer_than_current_passes(self):
+        cur = self.current(manifest_doc(version=OLD, published="2026-11-07T06:00:00Z"))
+        rc, _, _ = self.validate(self.new_file(), cur)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh_outputs()["version"], NEW)
+        self.assertEqual(self.web.calls, [])
+
+    def test_same_version_later_passes(self):
+        cur = self.current(manifest_doc(version=NEW, published="2026-11-07T06:00:00Z"))
+        rc, _, _ = self.validate(self.new_file(), cur)
+        self.assertEqual(rc, 0)
+
+    def test_size_bounds_are_inclusive(self):
+        for size, want in ((self.MIB - 1, 1), (self.MIB, 0),
+                           (700 * self.MIB, 0), (700 * self.MIB + 1, 1)):
+            self.gh_outputs_reset()
+            rc, _, _ = self.validate(self.new_file(manifest_doc(
+                version=NEW, published=NOW_S, size=size)))
+            self.assertEqual(rc, want, size)
+
+    def test_one_bad_size_among_eight_fails(self):
+        doc = manifest_doc(version=NEW, published=NOW_S, size=5 * self.MIB)
+        doc["stable"]["downloads"]["chrome"]["mac-x64"]["size"] = 10
+        rc, _, _ = self.validate(self.new_file(doc))
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.gh_outputs(), {})
+
+    def test_published_five_minutes_ahead_passes_six_fails(self):
+        ok = manifest_doc(version=NEW, published="2026-11-08T12:05:00Z", size=5 * self.MIB)
+        self.assertEqual(self.validate(self.new_file(ok))[0], 0)
+        self.gh_outputs_reset()
+        bad = manifest_doc(version=NEW, published="2026-11-08T12:05:01Z", size=5 * self.MIB)
+        rc, _, _ = self.validate(self.new_file(bad))
+        self.assertEqual(rc, 1)
+        self.assertIn("future", self.summary_text())
+
+    def test_schema_violation_fails(self):
+        doc = manifest_doc(version=NEW, published=NOW_S, size=5 * self.MIB)
+        doc["extra"] = 1
+        self.assertEqual(self.validate(self.new_file(doc))[0], 1)
+
+    def test_bad_hex_fails(self):
+        doc = manifest_doc(version=NEW, published=NOW_S, size=5 * self.MIB)
+        doc["stable"]["downloads"]["chrome"]["linux64"]["sha256"] = "F" * 64
+        self.assertEqual(self.validate(self.new_file(doc))[0], 1)
+
+    def test_missing_new_file_fails(self):
+        self.assertEqual(self.validate(os.path.join(self.tmp, "absent.json"))[0], 1)
+
+    def test_published_must_be_strictly_later_than_current(self):
+        cur = self.current(manifest_doc(version=OLD, published=NOW_S))
+        self.assertEqual(self.validate(self.new_file(), cur)[0], 1)  # equal
+        cur2 = self.current(manifest_doc(version=OLD, published="2026-11-08T12:00:01Z"),
+                            name="cur2.json")
+        self.assertEqual(self.validate(self.new_file(), cur2)[0], 1)  # new is earlier
+        cur3 = self.current(manifest_doc(version=OLD, published="2026-11-08T11:59:59Z"),
+                            name="cur3.json")
+        self.assertEqual(self.validate(self.new_file(), cur3)[0], 0)  # new is later
+
+    def test_lower_version_refused_unless_allowed(self):
+        cur = self.current(manifest_doc(version=NEW, published="2026-11-07T06:00:00Z"))
+        new = self.new_file(manifest_doc(version=OLD, published=NOW_S, size=5 * self.MIB))
+        self.assertEqual(self.validate(new, cur)[0], 1)
+        self.gh_outputs_reset()
+        self.assertEqual(self.validate(new, cur, extra=["--allow-downgrade"])[0], 0)
+        self.assertEqual(self.gh_outputs()["version"], OLD)
+
+    def test_downgrade_still_needs_later_published(self):
+        cur = self.current(manifest_doc(version=NEW, published=NOW_S))
+        new = self.new_file(manifest_doc(version=OLD, published=NOW_S, size=5 * self.MIB))
+        self.assertEqual(self.validate(new, cur, extra=["--allow-downgrade"])[0], 1)
+
+    def test_invalid_current_fails(self):
+        bad = manifest_doc(version=OLD, published="2026-11-07T06:00:00Z")
+        bad["schema"] = 2
+        cur = self.current(bad)
+        self.assertEqual(self.validate(self.new_file(), cur)[0], 1)
+
+    def test_missing_current_fails(self):
+        self.assertEqual(self.validate(self.new_file(), os.path.join(self.tmp, "nope.json"))[0], 1)
+
+    def test_run_id_required(self):
+        args = ["--validate", self.new_file(), "none"]
+        self.assertEqual(self.main(args)[0], 1)
+        self.assertEqual(self.main(args + ["--run-id", "x1"])[0], 1)
+
+    def test_run_id_from_environment(self):
+        os.environ["GITHUB_RUN_ID"] = "4242"
+        rc, _, _ = self.main(["--validate", self.new_file(), "none"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.gh_outputs()["trusted_comment"].endswith("run=4242"))
+
+    def test_comment_is_computed_from_manifest_fields(self):
+        rc, _, _ = self.validate(self.new_file(manifest_doc(
+            version="150.1.2.3", published="2026-11-08T10:00:00Z", size=5 * self.MIB)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh_outputs()["trusted_comment"],
+                         f"clauseo-browser-pins v1 published=2026-11-08T10:00:00Z "
+                         f"version=150.1.2.3 run={RUN}")
+
+    def gh_outputs_reset(self):
+        if os.path.exists(self.gh_output):
+            os.remove(self.gh_output)
+
+
 if __name__ == "__main__":
     unittest.main()
