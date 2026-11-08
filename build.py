@@ -3,6 +3,7 @@
 """Build the Clauseo browser pins v1 (see SPEC.md).
 
   build.py CURRENT --out-dir OUT [--allow-downgrade] [--run-id N]
+  build.py --validate NEW CURRENT [--allow-downgrade] [--run-id N]
   build.py --live-check
   build.py --check-comment MANIFEST COMMENT
 
@@ -45,7 +46,9 @@ COMMENT_PREFIX = "clauseo-browser-pins v1"
 MANIFEST_NAME = "browser-pins-v1.json"
 TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-MAX_DOWNLOAD_BYTES = 700 * 1024 * 1024
+MIN_ASSET_BYTES = 1024 * 1024
+MAX_ASSET_BYTES = 700 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = MAX_ASSET_BYTES  # a zip larger than this is refused
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 CHUNK = 1024 * 1024
@@ -433,9 +436,7 @@ def run_build(current_arg: str, out_dir: str, allow_downgrade: bool, run_id: str
         with tempfile.TemporaryDirectory(prefix="browser-pins-",
                                          dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
             downloads = inspect_downloads(version, tmp)
-        how = ("New Stable version, all 8 downloads inspected." if current is None or
-               version_key(version) != version_key(current["stable"]["version"])
-               else "Same version, re-downloaded.")
+        how = "New Stable version, all 8 downloads inspected."
         if current is not None and version_key(version) < version_key(current["stable"]["version"]):
             how = "DOWNGRADE: Google lists an older Stable; published because allow_downgrade is set."
 
@@ -452,6 +453,36 @@ def run_build(current_arg: str, out_dir: str, allow_downgrade: bool, run_id: str
             lines.append(f"| {name} | {platform} | `{e['sha256']}` | {e['size']} |")
     return ({"publish": "true", "version": version, "trusted_comment": comment},
             "\n".join(lines))
+
+
+def validate_new(new_path: str, current_arg: str, allow_downgrade: bool, run_id: str) -> dict:
+    """Check a manifest built by the build job, without touching the network or any zip.
+    The trusted comment is computed here from NEW's own published and version, never read
+    from the file. Return {"trusted_comment": ..., "version": ...} or raise BuildError."""
+    if not run_id or not RUN_RE.fullmatch(run_id):
+        raise BuildError("run id is missing or not all digits (--run-id, or $GITHUB_RUN_ID)")
+    doc = read_manifest(new_path)
+    for name in NAMES:
+        for platform in PLATFORMS:
+            size = doc["stable"]["downloads"][name][platform]["size"]
+            if not MIN_ASSET_BYTES <= size <= MAX_ASSET_BYTES:
+                raise BuildError(f"{name} {platform}: size {size} is outside "
+                                 f"{MIN_ASSET_BYTES}..{MAX_ASSET_BYTES} bytes")
+    published = parse_published(doc["published"])
+    if published > now_utc() + FUTURE_SLACK:
+        raise BuildError(f"published {doc['published']} is more than 5 minutes in the future")
+    version = doc["stable"]["version"]
+    if current_arg != "none":
+        current = read_manifest(current_arg)
+        if published <= parse_published(current["published"]):
+            raise BuildError(f"published {doc['published']} is not later than the current "
+                             f"{current['published']}")
+        cur_version = current["stable"]["version"]
+        if version_key(version) < version_key(cur_version) and not allow_downgrade:
+            raise BuildError(f"new version {version} is lower than the current {cur_version}; "
+                             "refusing (allow_downgrade is off)")
+    return {"trusted_comment": trusted_comment(doc["published"], version, run_id),
+            "version": version}
 
 
 def check_comment(manifest_path: str, comment: str) -> None:
@@ -505,6 +536,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="publish a lower Stable version (for Google pulling a release)")
     p.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""),
                    help="GitHub Actions run ID for the trusted comment (default: $GITHUB_RUN_ID)")
+    p.add_argument("--validate", nargs=2, metavar=("NEW", "CURRENT"),
+                   help='check NEW against CURRENT (or "none"); print trusted_comment and version')
     p.add_argument("--live-check", action="store_true",
                    help="fetch the Stable list, print it and check the URLs; download nothing")
     p.add_argument("--check-comment", nargs=2, metavar=("MANIFEST", "COMMENT"),
@@ -518,6 +551,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_comment:
             check_comment(*args.check_comment)
             print("trusted comment matches the manifest body")
+            return 0
+        if args.validate:
+            new_path, current_arg = args.validate
+            result = validate_new(new_path, current_arg, args.allow_downgrade, args.run_id)
+            write_summary("## Clauseo browser pins validation\n\n"
+                          f"Version {result['version']} passed the checks. "
+                          f"Trusted comment: `{result['trusted_comment']}`")
+            emit(result)
             return 0
         if args.current is None or args.out_dir is None:
             p.error("CURRENT and --out-dir are required")
