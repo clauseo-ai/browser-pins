@@ -3,7 +3,7 @@
 """Build the Clauseo browser pins v1 (see SPEC.md).
 
   build.py CURRENT --out-dir OUT [--allow-downgrade] [--run-id N]
-  build.py --validate NEW CURRENT [--allow-downgrade] [--run-id N]
+  build.py --validate NEW CURRENT [--allow-downgrade] [--run-id N] [--no-google]
   build.py --live-check
   build.py --check-comment MANIFEST COMMENT
 
@@ -86,6 +86,33 @@ def open_url(url: str):
         raise BuildError(f"fetch {url}: HTTP {e.code}") from None
     except (urllib.error.URLError, OSError) as e:
         raise BuildError(f"fetch {url}: {e}") from None
+
+
+def open_head(url: str):
+    """A HEAD request for url: the only other network access in this file. Tests replace it."""
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
+    try:
+        return urllib.request.urlopen(req, timeout=TIMEOUT)
+    except urllib.error.HTTPError as e:
+        raise BuildError(f"HEAD {url}: HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise BuildError(f"HEAD {url}: {e}") from None
+
+
+def head_length(url: str) -> int:
+    """The Content-Length that url answers to a HEAD request. Must be 200 with a length."""
+    with open_head(url) as resp:
+        status = getattr(resp, "status", None)
+        if status != 200:
+            raise BuildError(f"HEAD {url}: HTTP {status}")
+        raw = resp.headers.get("Content-Length") if resp.headers is not None else None
+    if raw is None:
+        raise BuildError(f"HEAD {url}: no Content-Length")
+    try:
+        length = int(raw)
+    except ValueError:
+        raise BuildError(f"HEAD {url}: Content-Length {raw!r} is not a number") from None
+    return length
 
 
 def _read_capped(resp, cap: int, what: str) -> bytes:
@@ -455,10 +482,29 @@ def run_build(current_arg: str, out_dir: str, allow_downgrade: bool, run_id: str
             "\n".join(lines))
 
 
-def validate_new(new_path: str, current_arg: str, allow_downgrade: bool, run_id: str) -> dict:
-    """Check a manifest built by the build job, without touching the network or any zip.
-    The trusted comment is computed here from NEW's own published and version, never read
-    from the file. Return {"trusted_comment": ..., "version": ...} or raise BuildError."""
+def google_check(doc: dict) -> None:
+    """Check NEW against Google: its version is the listed Stable, and each of the 8 files
+    answers to a HEAD with the size NEW gives. No file is downloaded."""
+    version, urls = parse_listing(fetch_json(CFT_URL))
+    check_urls(version, urls)
+    if doc["stable"]["version"] != version:
+        raise BuildError(f"new version {doc['stable']['version']} is not Google's listed Stable "
+                         f"{version}")
+    for name in NAMES:
+        for platform in PLATFORMS:
+            want = doc["stable"]["downloads"][name][platform]["size"]
+            got = head_length(expected_url(version, name, platform))
+            if got != want:
+                raise BuildError(f"{name} {platform}: manifest says {want} bytes, Google's file "
+                                 f"is {got} bytes")
+
+
+def validate_new(new_path: str, current_arg: str, allow_downgrade: bool, run_id: str,
+                 google: bool = True) -> dict:
+    """Check a manifest built by the build job. The trusted comment is computed here from NEW's
+    own published and version, never read from the file. With google (the default), also check
+    NEW's version and file sizes against Google's listing and HEAD answers; no zip is downloaded.
+    Return {"trusted_comment": ..., "version": ...} or raise BuildError."""
     if not run_id or not RUN_RE.fullmatch(run_id):
         raise BuildError("run id is missing or not all digits (--run-id, or $GITHUB_RUN_ID)")
     doc = read_manifest(new_path)
@@ -481,6 +527,8 @@ def validate_new(new_path: str, current_arg: str, allow_downgrade: bool, run_id:
         if version_key(version) < version_key(cur_version) and not allow_downgrade:
             raise BuildError(f"new version {version} is lower than the current {cur_version}; "
                              "refusing (allow_downgrade is off)")
+    if google:
+        google_check(doc)
     return {"trusted_comment": trusted_comment(doc["published"], version, run_id),
             "version": version}
 
@@ -537,7 +585,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""),
                    help="GitHub Actions run ID for the trusted comment (default: $GITHUB_RUN_ID)")
     p.add_argument("--validate", nargs=2, metavar=("NEW", "CURRENT"),
-                   help='check NEW against CURRENT (or "none"); print trusted_comment and version')
+                   help='check NEW against CURRENT (or "none") and Google; print trusted_comment and version')
+    p.add_argument("--no-google", action="store_true",
+                   help="with --validate: skip the Google checks (tests only)")
     p.add_argument("--live-check", action="store_true",
                    help="fetch the Stable list, print it and check the URLs; download nothing")
     p.add_argument("--check-comment", nargs=2, metavar=("MANIFEST", "COMMENT"),
@@ -554,9 +604,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.validate:
             new_path, current_arg = args.validate
-            result = validate_new(new_path, current_arg, args.allow_downgrade, args.run_id)
+            result = validate_new(new_path, current_arg, args.allow_downgrade, args.run_id,
+                                  google=not args.no_google)
             write_summary("## Clauseo browser pins validation\n\n"
-                          f"Version {result['version']} passed the checks. "
+                          f"Version {result['version']} passed the checks"
+                          f"{'' if args.no_google else ' (Google listing and file sizes)'}. "
                           f"Trusted comment: `{result['trusted_comment']}`")
             emit(result)
             return 0

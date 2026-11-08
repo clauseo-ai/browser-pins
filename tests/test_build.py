@@ -22,6 +22,8 @@ sys.path.insert(0, ROOT)
 
 import build  # noqa: E402
 
+REAL_OPEN_HEAD = build.open_head  # Base replaces build.open_head; these tests need the real one
+
 NAMES = ("chrome-headless-shell", "chrome")
 PLATFORMS = ("win64", "mac-arm64", "mac-x64", "linux64")
 TEMPLATE = ("https://storage.googleapis.com/chrome-for-testing-public/"
@@ -81,6 +83,28 @@ class FakeResponse(io.BytesIO):
         self.headers = headers or {}
 
 
+class FakeHead:
+    """Stands in for build.open_head. Statuses >= 400 raise, as the real one does."""
+
+    def __init__(self):
+        self.routes = {}
+        self.calls = []
+
+    def serve(self, url, status=200, headers=None):
+        self.routes[url] = (status, headers if headers is not None else {})
+
+    def __call__(self, url):
+        self.calls.append(url)
+        if url not in self.routes:
+            raise build.BuildError(f"HEAD {url}: not served by the test")
+        status, headers = self.routes[url]
+        if status >= 400:
+            raise build.BuildError(f"HEAD {url}: HTTP {status}")
+        resp = FakeResponse(b"", headers)
+        resp.status = status
+        return resp
+
+
 class FakeWeb:
     """Stands in for build.open_url. Records every URL; unknown URLs fail."""
 
@@ -133,8 +157,12 @@ class Base(unittest.TestCase):
         os.environ.pop("GITHUB_RUN_ID", None)
         self.web_patch = mock.patch.object(build, "open_url", self.web)
         self.web_patch.start()
+        self.heads = FakeHead()
+        self.head_patch = mock.patch.object(build, "open_head", self.heads)
+        self.head_patch.start()
 
     def tearDown(self):
+        self.head_patch.stop()
         self.web_patch.stop()
         self.env_patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -754,7 +782,8 @@ class ValidateModeTest(Base):
             version=NEW, published=NOW_S, size=5 * self.MIB))
 
     def validate(self, new, current="none", extra=(), now=NOW):
-        args = ["--validate", new, current, "--run-id", RUN] + list(extra)
+        # the local rules only: the Google checks have their own class
+        args = ["--validate", new, current, "--run-id", RUN, "--no-google"] + list(extra)
         return self.main(args, now=now)
 
     def test_first_run_passes_and_computes_comment(self):
@@ -854,7 +883,7 @@ class ValidateModeTest(Base):
 
     def test_run_id_from_environment(self):
         os.environ["GITHUB_RUN_ID"] = "4242"
-        rc, _, _ = self.main(["--validate", self.new_file(), "none"])
+        rc, _, _ = self.main(["--validate", self.new_file(), "none", "--no-google"])
         self.assertEqual(rc, 0)
         self.assertTrue(self.gh_outputs()["trusted_comment"].endswith("run=4242"))
 
@@ -869,6 +898,136 @@ class ValidateModeTest(Base):
     def gh_outputs_reset(self):
         if os.path.exists(self.gh_output):
             os.remove(self.gh_output)
+
+
+class GoogleCheckTest(Base):
+    """build.py --validate's Google checks: the listed version, and each file's HEAD length."""
+
+    MIB = 1024 * 1024
+
+    def setUp(self):
+        super().setUp()
+        self.serve_listing(NEW)
+
+    def serve_heads(self, version=NEW, size=5 * MIB, sizes=None, status=200, headers=None):
+        """Serve HEAD answers for the 8 files of version. sizes: {(name, platform): length}."""
+        sizes = sizes or {}
+        for name in NAMES:
+            for p in PLATFORMS:
+                length = sizes.get((name, p), size)
+                h = headers if headers is not None else {"Content-Length": str(length)}
+                self.heads.serve(url_for(version, name, p), status=status, headers=h)
+
+    def new_doc(self, version=NEW, size=5 * MIB, sizes=None):
+        doc = manifest_doc(version=version, published=NOW_S, size=size)
+        for (name, p), length in (sizes or {}).items():
+            doc["stable"]["downloads"][name][p]["size"] = length
+        return doc
+
+    def validate_google(self, doc, current="none"):
+        path = write_json(os.path.join(self.tmp, "new.json"), doc)
+        return self.main(["--validate", path, current, "--run-id", RUN])
+
+    def test_pass_checks_listing_and_all_eight_heads(self):
+        self.serve_heads()
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh_outputs()["version"], NEW)
+        self.assertEqual(self.web.calls, [CFT])
+        want = sorted(url_for(NEW, n, p) for n in NAMES for p in PLATFORMS)
+        self.assertEqual(sorted(self.heads.calls), want)
+        self.assertEqual(self.web.zip_calls(), [])
+
+    def test_version_not_listed_fails(self):
+        # a higher version nobody lists: its files may even exist, the version still fails
+        self.serve_heads(version="999.0.0.0")
+        rc, _, _ = self.validate_google(self.new_doc(version="999.0.0.0"))
+        self.assertEqual(rc, 1)
+        self.assertIn("not Google's listed Stable", self.summary_text())
+        self.assertEqual(self.gh_outputs(), {})
+        self.assertEqual(self.heads.calls, [])
+
+    def test_lower_listed_version_fails(self):
+        self.serve_heads(version="156.0.0.0")
+        rc, _, _ = self.validate_google(self.new_doc(version="156.0.0.0"))
+        self.assertEqual(rc, 1)
+
+    def test_listing_url_mismatch_fails(self):
+        self.web.serve(CFT, json.dumps(listing_doc(NEW, urls={
+            ("chrome", "win64"): "https://evil.example/c.zip"})).encode())
+        self.serve_heads()
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.heads.calls, [])
+
+    def test_404_on_a_file_fails(self):
+        self.serve_heads()
+        self.heads.serve(url_for(NEW, "chrome", "linux64"), status=404)
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+        self.assertIn("HTTP 404", self.summary_text())
+        self.assertEqual(self.gh_outputs(), {})
+
+    def test_size_mismatch_fails(self):
+        self.serve_heads(sizes={("chrome", "mac-arm64"): 5 * self.MIB + 1})
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+        self.assertIn("chrome mac-arm64", self.summary_text())
+        self.assertIn("bytes", self.summary_text())
+
+    def test_wrong_size_from_the_manifest_fails(self):
+        # the manifest's size is 5 MiB; Google's file is the length served
+        self.serve_heads(size=6 * self.MIB)
+        rc, _, _ = self.validate_google(self.new_doc(size=5 * self.MIB))
+        self.assertEqual(rc, 1)
+
+    def test_missing_content_length_fails(self):
+        self.serve_heads(headers={})
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+        self.assertIn("no Content-Length", self.summary_text())
+
+    def test_non_numeric_content_length_fails(self):
+        self.serve_heads(headers={"Content-Length": "lots"})
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+
+    def test_non_200_success_status_fails(self):
+        self.serve_heads(status=204)
+        rc, _, _ = self.validate_google(self.new_doc())
+        self.assertEqual(rc, 1)
+        self.assertIn("HTTP 204", self.summary_text())
+
+    def test_no_google_skips_all_network(self):
+        self.serve_heads(version="999.0.0.0")
+        path = write_json(os.path.join(self.tmp, "new.json"), self.new_doc(version="999.0.0.0"))
+        rc, _, _ = self.main(["--validate", path, "none", "--run-id", RUN, "--no-google"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.web.calls, [])
+        self.assertEqual(self.heads.calls, [])
+
+    def test_local_rules_still_apply_with_google(self):
+        self.serve_heads()
+        doc = self.new_doc()
+        doc["stable"]["downloads"]["chrome"]["linux64"]["size"] = 10  # below 1 MiB
+        rc, _, _ = self.validate_google(doc)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.heads.calls, [])
+
+    def test_head_request_uses_head_method(self):
+        with mock.patch.object(build.urllib.request, "urlopen") as uo:
+            uo.return_value = io.BytesIO(b"")
+            REAL_OPEN_HEAD("https://example.invalid/x.zip")
+        req = uo.call_args[0][0]
+        self.assertEqual(req.get_method(), "HEAD")
+        self.assertEqual(req.full_url, "https://example.invalid/x.zip")
+
+    def test_open_head_turns_http_errors_into_build_errors(self):
+        import urllib.error
+        err = urllib.error.HTTPError("https://example.invalid/x.zip", 404, "Not Found", {}, None)
+        with mock.patch.object(build.urllib.request, "urlopen", side_effect=err):
+            with self.assertRaisesRegex(build.BuildError, "HTTP 404"):
+                REAL_OPEN_HEAD("https://example.invalid/x.zip")
 
 
 if __name__ == "__main__":
