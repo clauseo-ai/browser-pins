@@ -2,6 +2,9 @@
 """Tests for scripts/fetch-current.sh: the rules for the release lookup and the
 incomplete-pair handling. curl and gh are replaced by fakes on PATH; no network."""
 
+import datetime as dt
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -46,6 +49,37 @@ cp "$FAKE_ASSETS"/* "$dir"/
 '''
 
 
+# fake minisign: succeeds only when the test sets FAKE_COMMENT, and then prints it
+# (-Q prints the signed trusted comment); otherwise it fails like a bad signature
+FAKE_MINISIGN = r'''#!/usr/bin/env bash
+if [ -z "${FAKE_COMMENT:-}" ]; then
+  exit 1
+fi
+printf '%s\n' "$FAKE_COMMENT"
+'''
+
+OLD_VERSION = "148.0.7778.1"
+
+
+def manifest_body(published, version=OLD_VERSION):
+    names = ("chrome-headless-shell", "chrome")
+    platforms = ("win64", "mac-arm64", "mac-x64", "linux64")
+    downloads = {}
+    for name in names:
+        downloads[name] = {}
+        for p in platforms:
+            sha = hashlib.sha256(f"{version}{name}{p}".encode()).hexdigest()
+            downloads[name][p] = {"sha256": sha, "size": 1000}
+    doc = {"schema": 1, "published": published,
+           "stable": {"version": version, "downloads": downloads}}
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def days_ago(days):
+    when = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    return when.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def release(*names):
     assets = ",".join('{"name": "%s"}' % n for n in names)
     return '{"tag_name": "current", "assets": [%s]}' % assets
@@ -56,7 +90,7 @@ class FetchCurrentTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="pins-fetch-")
         self.bin = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin)
-        for name, body in (("curl", FAKE_CURL), ("gh", FAKE_GH)):
+        for name, body in (("curl", FAKE_CURL), ("gh", FAKE_GH), ("minisign", FAKE_MINISIGN)):
             path = os.path.join(self.bin, name)
             with open(path, "w") as f:
                 f.write(body)
@@ -70,12 +104,14 @@ class FetchCurrentTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_fetch(self, code, release_json=None, assets=(), recover=False):
+    def run_fetch(self, code, release_json=None, assets=(), recover=False, contents=None,
+                  comment=""):
+        contents = contents or {}
         with open(self.release_file, "w") as f:
             f.write(release_json or release())
         for name in assets:
             with open(os.path.join(self.assets, name), "w") as f:
-                f.write("junk\n")
+                f.write(contents.get(name, "junk\n"))
         env = {
             "PATH": self.bin + os.pathsep + os.environ.get("PATH", ""),
             "HOME": self.tmp,
@@ -85,6 +121,7 @@ class FetchCurrentTest(unittest.TestCase):
             "FAKE_HTTP_CODE": str(code),
             "FAKE_RELEASE": self.release_file,
             "FAKE_ASSETS": self.assets,
+            "FAKE_COMMENT": comment,
             "GITHUB_STEP_SUMMARY": self.summary,
             "RUNNER_TEMP": self.tmp,
         }
@@ -148,6 +185,33 @@ class FetchCurrentTest(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         self.assertIn("do not verify", r.stderr)
         self.assertIn("**Failed:**", self.summary_text())
+
+    def run_verified_current(self, published):
+        """A current release whose manifest and signature verify (fake minisign), published at `published`."""
+        body = manifest_body(published)
+        comment = f"clauseo-browser-pins v1 published={published} version={OLD_VERSION} run=1"
+        return self.run_fetch(200, release(MANIFEST, MANIFEST + ".minisig"),
+                              assets=[MANIFEST, MANIFEST + ".minisig"],
+                              contents={MANIFEST: body}, comment=comment)
+
+    def test_current_published_2_days_ago_has_no_warning(self):
+        r = self.run_verified_current(days_ago(2))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), os.path.join(self.dest, MANIFEST))
+        self.assertNotIn("::warning::", r.stderr)
+        self.assertNotIn("Warning", self.summary_text())
+        self.assertIn("Verified the current assets", self.summary_text())
+
+    def test_current_published_4_days_ago_warns(self):
+        published = days_ago(4)
+        r = self.run_verified_current(published)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), os.path.join(self.dest, MANIFEST))
+        self.assertIn("::warning::", r.stderr)
+        self.assertIn("published 4 days ago", r.stderr)
+        self.assertIn("**Warning:** the current manifest was published 4 days ago "
+                      f"({published}), more than 3: recent publishes have not succeeded.",
+                      self.summary_text())
 
 
 if __name__ == "__main__":
