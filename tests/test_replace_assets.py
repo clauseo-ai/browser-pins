@@ -13,8 +13,8 @@ ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "scripts", "replace-assets.sh")
 
 # The release is $FAKE_REL: one directory per asset id holding `name` and `data`; the next id is
-# in $FAKE_REL.id. Every call is logged to $FAKE_LOG. Like GitHub, renaming an asset to a name
-# another asset has fails (HTTP 422), and a missing asset id is HTTP 404.
+# in $FAKE_REL.id. Every call is logged to $FAKE_LOG. Renaming an asset to a name an asset has
+# fails (HTTP 422), that asset's own name included, and a missing asset id is HTTP 404.
 FAKE_GH = r'''#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG"
 by_name() {
@@ -42,6 +42,10 @@ case "$1 $2" in
       [ -d "$d" ] || continue
       echo "$(cat "$d/name") $(stat -c %s "$d/data") https://api.github.test/assets/$(basename "$d")"
     done ;;
+  "api https:"*)
+    id=${2##*/}
+    [ -d "$FAKE_REL/$id" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    cat "$FAKE_REL/$id/name"; echo ;;
   "api -X")
     method=$3 url=$4 id=${4##*/}
     [ -d "$FAKE_REL/$id" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
@@ -54,8 +58,9 @@ case "$1 $2" in
       PATCH)
         n=${6#name=}
         other=$(by_name "$n")
-        if [ -n "$other" ] && [ "$other" != "$id" ]; then echo "HTTP 422" >&2; exit 1; fi
-        printf '%s' "$n" > "$FAKE_REL/$id/name" ;;
+        if [ -n "$other" ]; then echo "HTTP 422" >&2; exit 1; fi
+        printf '%s' "$n" > "$FAKE_REL/$id/name"
+        if [ -n "${FAKE_LOSE_PATCH_ANSWER:-}" ]; then echo "HTTP 502" >&2; exit 1; fi ;;
     esac ;;
   *) echo "unexpected gh call: $*" >&2; exit 2 ;;
 esac
@@ -158,6 +163,13 @@ class ReplaceAssets(unittest.TestCase):
         self.put("a.bin", "old data\n")
         self.put("a.bin.minisig", "old sig\n")
         r = self.run_script(FAKE_LOSE_DELETE_ANSWER="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.release(), {"a.bin": "new data\n", "a.bin.minisig": "new sig\n"})
+
+    def test_lost_rename_answer_counts_as_renamed(self):
+        self.put("a.bin", "old data\n")
+        self.put("a.bin.minisig", "old sig\n")
+        r = self.run_script(FAKE_LOSE_PATCH_ANSWER="1")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.release(), {"a.bin": "new data\n", "a.bin.minisig": "new sig\n"})
 

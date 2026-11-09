@@ -4,6 +4,7 @@
 /scripts/sign.sh @ro-hansolo
 /scripts/verify.sh @ro-hansolo
 /scripts/fetch-current.sh @ro-hansolo
+/scripts/replace-assets.sh @ro-hansolo
 /build.py @ro-hansolo
 /minisign.pub @ro-hansolo
 /minisign-next.pub @ro-hansolo

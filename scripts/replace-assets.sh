@@ -45,6 +45,12 @@ delete_asset() {
   echo "$out" >&2
   return 1
 }
+# Renames the asset at API URL $1 to $2. A retry after a rename whose answer was lost gets HTTP
+# 422 (the name is taken, by this asset), so an asset that already has the name counts as renamed.
+rename_asset() {
+  gh api -X PATCH "$1" -f name="$2" --silent && return 0
+  [ "$(gh api "$1" --jq .name 2>/dev/null)" = "$2" ]
+}
 # Prints "<name> <size> <api url>" for each asset of the release.
 assets() {
   gh release view "$tag" --json assets --jq '.assets[] | "\(.name) \(.size) \(.apiUrl)"'
@@ -77,7 +83,7 @@ for f in "$@"; do
   if [ -n "$old" ]; then
     retry delete_asset "$old" || fail "could not delete the old $name from release $tag."
   fi
-  retry gh api -X PATCH "$new" -f name="$name" --silent ||
+  retry rename_asset "$new" "$name" ||
     fail "could not rename $name$suffix to $name on release $tag."
 done
 
