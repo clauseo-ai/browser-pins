@@ -231,7 +231,8 @@ jobs:
               --notes "The signed Clauseo browser pins (Chrome for Testing builds, format: SPEC.md), refreshed every 3 hours. Its two assets are replaced in place on each run. How to verify: https://github.com/${GH_REPO}#readme" \
               --target "$GITHUB_SHA"
           fi
-          gh release upload current "$OUT/browser-pins-v1.json" "$OUT/browser-pins-v1.json.minisig" --clobber
+          # Uploads under temporary names, then swaps each asset into place (scripts/replace-assets.sh).
+          scripts/replace-assets.sh current "$OUT/browser-pins-v1.json" "$OUT/browser-pins-v1.json.minisig"
           echo "Published to release \`current\`." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run summary
